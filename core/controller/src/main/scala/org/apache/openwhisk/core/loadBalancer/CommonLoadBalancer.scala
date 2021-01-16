@@ -21,7 +21,7 @@ import akka.actor.ActorRef
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.LongAdder
 
-import akka.actor.ActorSystem
+import akka.actor.{ActorSystem, Cancellable}
 import akka.event.Logging.InfoLevel
 import akka.stream.ActorMaterializer
 import org.apache.kafka.clients.producer.RecordMetadata
@@ -39,6 +39,54 @@ import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
+
+
+/**
+ * Configuration for the cluster created between loadbalancers.
+ *
+ * @param useClusterBootstrap Whether or not to use a bootstrap mechanism
+ */
+case class ClusterConfig(useClusterBootstrap: Boolean)
+
+/**
+ * State kept for each activation slot until completion.
+ *
+ * @param id id of the activation
+ * @param namespaceId namespace that invoked the action
+ * @param invokerName invoker the action is scheduled to
+ * @param memoryLimit memory limit of the invoked action
+ * @param timeLimit time limit of the invoked action
+ * @param maxConcurrent concurrency limit of the invoked action
+ * @param fullyQualifiedEntityName fully qualified name of the invoked action
+ * @param timeoutHandler times out completion of this activation, should be canceled on good paths
+ * @param isBlackbox true if the invoked action is a blackbox action, otherwise false (managed action)
+ * @param isBlocking true if the action is invoked in a blocking fashion, i.e. "somebody" waits for the result
+ */
+case class ActivationEntry(id: ActivationId,
+                           namespaceId: UUID,
+                           invokerName: InvokerInstanceId,
+                           memoryLimit: ByteSize,
+                           timeLimit: FiniteDuration,
+                           maxConcurrent: Int,
+                           fullyQualifiedEntityName: FullyQualifiedEntityName,
+                           timeoutHandler: Cancellable,
+                           isBlackbox: Boolean,
+                           isBlocking: Boolean)
+
+
+/**
+ * Configuration for the sharding container pool balancer.
+ *
+ * @param blackboxFraction the fraction of all invokers to use exclusively for blackboxes
+ * @param timeoutFactor factor to influence the timeout period for forced active acks (time-limit.std * timeoutFactor + timeoutAddon)
+ * @param timeoutAddon extra time to influence the timeout period for forced active acks (time-limit.std * timeoutFactor + timeoutAddon)
+ */
+case class CommonBalancerConfig(managedFraction: Double,
+                                               blackboxFraction: Double,
+                                               timeoutFactor: Int,
+                                               timeoutAddon: FiniteDuration)
+
+
 /**
  * Abstract class which provides common logic for all LoadBalancer implementations.
  */
@@ -52,8 +100,8 @@ abstract class CommonLoadBalancer(config: WhiskConfig,
 
   protected implicit val executionContext: ExecutionContext = actorSystem.dispatcher
 
-  val lbConfig: ShardingContainerPoolBalancerConfig =
-    loadConfigOrThrow[ShardingContainerPoolBalancerConfig](ConfigKeys.loadbalancer)
+  val lbConfig: CommonBalancerConfig =
+    loadConfigOrThrow[CommonBalancerConfig](ConfigKeys.loadbalancer)
   protected val invokerPool: ActorRef
 
   /** State related to invocations and throttling */

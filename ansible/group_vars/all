@@ -80,8 +80,8 @@ limits:
 __controller_ssl_keyPrefix: "controller-"
 __controller_blackbox_fraction: 0.10
 # JONAS: add choice of load balancer here as a variable
-#__jonas_balancer: "org.apache.openwhisk.core.loadBalancer.CustomLoadBalancer"
-__jonas_balancer: "org.apache.openwhisk.core.loadBalancer.ShardingContainerPoolBalancer"
+__jonas_balancer: "org.apache.openwhisk.core.loadBalancer.ThesisNetworkBalancer"
+#__jonas_balancer: "org.apache.openwhisk.core.loadBalancer.ShardingContainerPoolBalancer"
 
 # port means outer port
 controller:

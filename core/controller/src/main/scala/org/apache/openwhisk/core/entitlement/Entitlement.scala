@@ -143,6 +143,7 @@ protected[core] abstract class EntitlementProvider(
 
   private val activationThrottleCalculator = loadBalancer match {
     // This loadbalancer applies sharding and does not share any state
+    // TODO JONAS THESIS: should I change anything here?
     case _: ShardingContainerPoolBalancer => calculateIndividualLimit _
     // Activation relevant data is shared by all other loadbalancers
     case _ => calculateLimit _
