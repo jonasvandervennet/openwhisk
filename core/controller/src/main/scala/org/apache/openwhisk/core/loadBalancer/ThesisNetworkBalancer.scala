@@ -5,7 +5,6 @@ package org.apache.openwhisk.core.loadBalancer
 
 import akka.actor.ActorRef
 import akka.actor.ActorRefFactory
-import java.util.concurrent.ThreadLocalRandom
 
 import akka.actor.{Actor, ActorSystem, Props}
 import akka.cluster.ClusterEvent._
@@ -152,6 +151,7 @@ class ThesisNetworkBalancer(
       val invoker: Option[(InvokerInstanceId, Boolean)] = ThesisNetworkBalancer.schedule(
         action.limits.concurrency.maxConcurrent,
         action.fullyQualifiedName(false),
+        action.name,
         invokersToUse,
         schedulingState.invokerSlots,
         action.limits.memory.megabytes)
@@ -252,34 +252,44 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
   def schedule(
     maxConcurrent: Int,
     fqn: FullyQualifiedEntityName,
+    fqnName: EntityName,
     invokers: IndexedSeq[InvokerHealth],
     dispatched: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]],
     slots: Int)(implicit logging: Logging, transId: TransactionId): Option[(InvokerInstanceId, Boolean)] = {
-    val numInvokers = invokers.size
-    logging.info(
-      this,
-      s"[THESIS] Number of invokers available: ${numInvokers}"
-    )
-
     val healthyInvokers = invokers.filter(_.status.isUsable)
     logging.info(
       this,
       s"[THESIS] Number of healthy invokers available: ${healthyInvokers.size}"
     )
-    logging.info(
-      this,
-      s"[THESIS]Healthy invokers available: ${healthyInvokers}"
-    )
-    logging.info(
-      this,
-      s"[THESIS]dispatched: ${dispatched}"
-    )
+    
     if (healthyInvokers.nonEmpty) {
+
+      val optimalInvokerIndexCharacter = if (fqnName.asString.contains("__")) {
+        // one of my compositions
+        val name_parts = fqnName.asString.split("__")
+
+        logging.info(
+          this,
+          s"[THESIS] This is function ${name_parts(1)} from composition ${name_parts(0)}"
+        )
+        name_parts(1).charAt(0)
+      } else {'o'}
+
+      val optimalInvokerIndex = optimalInvokerIndexCharacter.toByte % healthyInvokers.size
+      logging.info(
+        this,
+        s"[THESIS] Invoker char is ${optimalInvokerIndexCharacter} -> ${optimalInvokerIndexCharacter.toByte}, or mapped: ${optimalInvokerIndex}"
+      )
+
+
       // Choose a healthy invoker randomly
-      val random = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
-      dispatched(random.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots) // could be tryAcquire too?
-      logging.warn(this, s"[THESIS] Chose invoker${random.toInt} by random assignment.")
-      Some(random, true)
+      // val index = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
+
+      // use optimal index
+      val index = healthyInvokers(optimalInvokerIndex).id
+      dispatched(index.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots) // could be tryAcquire too?
+      logging.warn(this, s"[THESIS] Chose invoker${index.toInt} by deliberate assignment.")
+      Some(index, true)
     } else {
       None
     }
