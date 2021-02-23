@@ -149,12 +149,14 @@ protected[actions] trait PrimitiveActions {
    *         or these custom failures:
    *            RequestEntityTooLarge if the message is too large to to post to the message bus
    */
+   // JONAS THESIS CHANGE: added parentTransid parameter
   private def invokeSimpleAction(
     user: Identity,
     action: ExecutableWhiskActionMetaData,
     payload: Option[JsObject],
     waitForResponse: Option[FiniteDuration],
-    cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
+    cause: Option[ActivationId],
+    parentTransid: TransactionId = TransactionId.unknown)(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
 
     // merge package parameters with action (action parameters supersede), then merge in payload
     val args = action.parameters merge payload
@@ -181,7 +183,8 @@ protected[actions] trait PrimitiveActions {
       action.parameters.initParameters,
       action.parameters.lockedParameters(payload.map(_.fields.keySet).getOrElse(Set.empty)),
       cause = cause,
-      WhiskTracerProvider.tracer.getTraceContext(transid))
+      WhiskTracerProvider.tracer.getTraceContext(transid),
+      parentTransid) // More detailed insights (I'm abusing logging IDs LOL)
 
     val postedFuture = loadBalancer.publish(action, message)
 
@@ -342,7 +345,8 @@ protected[actions] trait PrimitiveActions {
           action = session.action,
           payload = params,
           waitForResponse = Some(session.action.limits.timeout.duration + 1.minute), // wait for result
-          cause = Some(session.activationId)) // cause is session id
+          cause = Some(session.activationId), // cause is session id
+          parentTid)
 
       waitForActivation(user, session, activationResponse).flatMap {
         case Left(response) => // unsuccessful invocation, return error response

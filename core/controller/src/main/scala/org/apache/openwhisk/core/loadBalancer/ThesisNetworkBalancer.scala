@@ -148,7 +148,32 @@ class ThesisNetworkBalancer(
           this, // ${action.namespace.toFullyQualifiedEntityName} || 
           s"[THESIS] deciding on invoker for ${action.fullyQualifiedName(false)}"
         )
+      logging.info(
+          this,
+          s"[THESIS] parentTransId: ${msg.ptransid}"
+        )
+      logging.info(
+          this,
+          s"[THESIS] transId: ${msg.transid}"
+        )
+      logging.info(
+          this,
+          s"[THESIS] action: ${msg.action}"
+        )
+      logging.info(
+          this,
+          s"[THESIS] activationId: ${msg.activationId}"
+        )
+      logging.info(
+          this,
+          s"[THESIS] content: ${msg.content}"
+        )
+      logging.info(
+          this,
+          s"[THESIS] cause: ${msg.cause}"
+        )
       val invoker: Option[(InvokerInstanceId, Boolean)] = ThesisNetworkBalancer.schedule(
+        msg,
         action.limits.concurrency.maxConcurrent,
         action.fullyQualifiedName(false),
         action.name,
@@ -250,6 +275,7 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
    * @return an invoker to schedule to or None of no invoker is available
    */
   def schedule(
+    msg: ActivationMessage,
     maxConcurrent: Int,
     fqn: FullyQualifiedEntityName,
     fqnName: EntityName,
@@ -257,13 +283,7 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
     dispatched: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]],
     slots: Int)(implicit logging: Logging, transId: TransactionId): Option[(InvokerInstanceId, Boolean)] = {
     val healthyInvokers = invokers.filter(_.status.isUsable)
-    logging.info(
-      this,
-      s"[THESIS] Number of healthy invokers available: ${healthyInvokers.size}"
-    )
-    
     if (healthyInvokers.nonEmpty) {
-
       val optimalInvokerIndexCharacter = if (fqnName.asString.contains("__")) {
         // one of my compositions
         val name_parts = fqnName.asString.split("__")
