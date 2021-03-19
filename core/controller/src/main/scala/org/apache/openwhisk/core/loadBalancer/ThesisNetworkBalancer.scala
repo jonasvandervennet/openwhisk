@@ -26,7 +26,9 @@ import org.apache.openwhisk.core.{ConfigKeys, WhiskConfig}
 import org.apache.openwhisk.spi.SpiLoader
 
 import scala.concurrent.Future
+import scala.collection.mutable.ListBuffer 
 import java.util.concurrent.ThreadLocalRandom
+import org.apache.commons.lang3.exception.ExceptionUtils // for printing stacktraces
 
 class ThesisNetworkBalancer(
   config: WhiskConfig,
@@ -147,31 +149,31 @@ class ThesisNetworkBalancer(
     val chosen = if (invokersToUse.nonEmpty) {
       logging.info(
           this, // ${action.namespace.toFullyQualifiedEntityName} || 
-          s"[THESIS] deciding on invoker for ${action.fullyQualifiedName(false)}"
+          s"[THESIS][PUBLISH] deciding on invoker for ${action.fullyQualifiedName(false)}"
         )
       logging.info(
           this,
-          s"[THESIS] parentTransId: ${msg.ptransid}"
+          s"[THESIS][PUBLISH] parentTransId: ${msg.ptransid}"
         )
       logging.info(
           this,
-          s"[THESIS] transId: ${msg.transid}"
+          s"[THESIS][PUBLISH] transId: ${msg.transid}"
         )
       logging.info(
           this,
-          s"[THESIS] action: ${msg.action}"
+          s"[THESIS][PUBLISH] action: ${msg.action}"
         )
       logging.info(
           this,
-          s"[THESIS] activationId: ${msg.activationId}"
+          s"[THESIS][PUBLISH] activationId: ${msg.activationId}"
         )
       logging.info(
           this,
-          s"[THESIS] content: ${msg.content}"
+          s"[THESIS][PUBLISH] content: ${msg.content}"
         )
       logging.info(
           this,
-          s"[THESIS] cause: ${msg.cause}"
+          s"[THESIS][PUBLISH] cause: ${msg.cause}"
         )
       val invoker: Option[(InvokerInstanceId, Boolean)] = ThesisNetworkBalancer.schedule(
         msg,
@@ -189,7 +191,7 @@ class ThesisNetworkBalancer(
     }
 
     // try to debug "error": "Failed to resolve action with name 'guest/increment' during composition."
-    logging.info(this, s"[OWN] chosen: ${chosen}")
+    logging.info(this, s"[THESIS][PUBLISH] chosen: ${chosen}")
 
     chosen
       .map { invoker =>
@@ -201,7 +203,7 @@ class ThesisNetworkBalancer(
         
         logging.info(
           this,
-          s"[OWN] scheduled activation ${msg.activationId}, action '${msg.action.asString}', ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker}")
+          s"[THESIS][PUBLISH] scheduled activation ${msg.activationId}, action '${msg.action.asString}', ns '${msg.user.namespace.name.asString}', mem limit ${memoryLimit.megabytes} MB (${memoryLimitInfo}), time limit ${timeLimit.duration.toMillis} ms (${timeLimitInfo}) to ${invoker}")
         val activationResult = setupActivation(msg, action, invoker)
         sendActivationToInvoker(messageProducer, msg, invoker).map(_ => activationResult)
       }
@@ -214,7 +216,7 @@ class ThesisNetworkBalancer(
 
         logging.error(
           this,
-          s"[OWN] failed to schedule activation ${msg.activationId}, action '${msg.action.asString}', ns '${msg.user.namespace.name.asString}' - invokers to use: $invokerStates")
+          s"[THESIS][PUBLISH] failed to schedule activation ${msg.activationId}, action '${msg.action.asString}', ns '${msg.user.namespace.name.asString}' - invokers to use: $invokerStates")
         Future.failed(LoadBalancerException("No invokers available"))
       }
   }
@@ -298,20 +300,22 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
     val currentTransid = msg.transid
     val outputSize = 3.14  // TODO: from action annotations, derive a formula to combine input dimensions to calculate output dimensions
 
-    if (parentTransid == TransactionId.unknown) {
-      // there should be a cause in the (recent) history of invocations
-      msg.cause match {
-        case Some(cause) => {
+    // there should be a cause in the (recent) history of invocations
+    msg.cause match {
+      case Some(cause) => {
+        if (parentTransid == TransactionId.unknown) {
           parentTransid = schedulingState.causeToTransidHistory(cause) // TODO: watch out for multi-influx pattern!
-          if (schedulingState.knownComposition(cause)) {schedulingState.addChildToComposition(currentTransid, parentTransid)}
-          else {schedulingState.addComposition(currentTransid, cause)}
         }
-        case None => {
-          logging.warn(this, s"[THESIS] Cause field is empty, but it was not expected to be..")
-        }
+        if (schedulingState.knownComposition(cause)) {schedulingState.addChildToComposition(currentTransid, parentTransid)}
+        else {schedulingState.addComposition(currentTransid, cause)}
       }
-      
+      case None => {
+        // TODO: this is probably true for non-composition functions
+        logging.warn(this, s"[THESIS][SCHEDULER] Is this a non-composition function?")
+        logging.warn(this, s"[THESIS][SCHEDULER] Cause field is empty, but it was not expected to be..")
+      }
     }
+
     var wasForceAcquisition = true
     val chosenInvokerId = if (parentTransid != TransactionId.unknown) {
       // there is a parent transaction id
@@ -323,7 +327,7 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
         val parentInvokerId = schedulingState.transidToInvokerMap(parentTransid)
         val parentInvoker = invokers(parentInvokerId.toInt)
         if (parentInvoker.status.isUsable && dispatched(parentInvokerId.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots)) {
-          logging.info(this, s"[THESIS] tryAcquire successful..")
+          logging.info(this, s"[THESIS][SCHEDULER] tryAcquire successful..")
           wasForceAcquisition = false
           parentInvokerId
         } else {
@@ -331,7 +335,7 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
           // GOAL: choose an empty invoker (as empty as possible) to house potential descendants as well
           // TODO: how to know invoker load?
           // for now: random healthy invoker
-          logging.info(this, s"[THESIS] line 329: force acquire..")
+          logging.info(this, s"[THESIS][SCHEDULER] 2nd force acquire..")
           val randomInvokerId = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
           dispatched(randomInvokerId.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
           randomInvokerId
@@ -341,42 +345,53 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
         // GOAL: choose an empty invoker (as empty as possible) to house potential descendants as well
         // TODO: how to know invoker load?
         // for now: random healthy invoker
-          logging.info(this, s"[THESIS] line 339: force acquire..")
+          logging.info(this, s"[THESIS][SCHEDULER] 3rd force acquire..")
         val randomInvokerId = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
         dispatched(randomInvokerId.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
         randomInvokerId
       }
     } else {
-      logging.warn(this, s"[THESIS] Have to fall back due to lack of scheduling information: Scheduled randomly!")
+      logging.warn(this, s"[THESIS][SCHEDULER] Have to fall back due to lack of scheduling information: Scheduled randomly!")
       val randomInvokerId = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
       dispatched(randomInvokerId.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
       randomInvokerId
     }
     logging.info(
       this,
-      s"[THESIS] Chosen invoker with ID ${chosenInvokerId.toInt} as target for execution"
+      s"[THESIS][SCHEDULER] Chosen invoker with ID ${chosenInvokerId.toInt} as target for execution"
     )
-
-    // Register transid with invoker choice
-    schedulingState.registerInvokerAcquisition(currentTransid, chosenInvokerId)
-    // Register start of output transfer
-    schedulingState.registerPendingOutputTransfer(currentTransid, outputSize, chosenInvokerId)
-    // Resolve potential incoming data transfer to finish
-    schedulingState.resolveIncomingDataTransfer(parentTransid, chosenInvokerId)
-    // Register cause-transid
-    msg.cause.foreach { c =>
-      schedulingState.updateCauseHistory(c, currentTransid)
+    try{
+      // Register transid with invoker choice
+      schedulingState.registerInvokerAcquisition(currentTransid, chosenInvokerId)
+      // Register start of output transfer
+      schedulingState.registerPendingOutputTransfer(currentTransid, outputSize, chosenInvokerId)
+      // Resolve potential incoming data transfer to finish
+      if (schedulingState.resolveIncomingDataTransfer(parentTransid, chosenInvokerId)) {
+        logging.info(this, s"[THESIS][SCHEDULER][BOOKKEEPING] resolved incoming data transfer!")
+      }else {
+        logging.info(this, s"[THESIS][SCHEDULER][BOOKKEEPING] no incoming data transfer to resolve..")
+      }
+      // Register cause-transid
+      msg.cause.foreach { c =>
+        schedulingState.updateCauseHistory(c, currentTransid)
+      }
+      if (fqnName.asString.contains("__") && fqnName.asString.split("__")(1) == "stop") {
+        // stop registering for this composition,
+        // log the internal bookkeeping structures
+        val transfers = schedulingState.finishComposition(schedulingState.getCompositionIdentifier(currentTransid))
+        logging.info(
+          this,
+          s"[THESIS][SCHEDULER] Transfers: ${transfers}"
+        )
+        // TODO: make sure any future action with the same root cause is handled properly
+      }
     }
-    if (fqnName.asString.contains("__") && fqnName.asString.split("__")(1) == "stop") {
-      // stop registering for this composition,
-      // log the internal bookkeeping structures
-      val transfers = schedulingState.finishComposition(schedulingState.getCompositionIdentifier(currentTransid))
-      logging.info(
+    catch {
+      case e:Exception => logging.error(
         this,
-        s"[THESIS] Transfers: ${transfers}"
+        s"[THESIS][SCHEDULER]\n${ExceptionUtils.getStackTrace(e)}"
       )
     }
-
     Some(chosenInvokerId, wasForceAcquisition)
   }
 }
@@ -392,7 +407,7 @@ case class ThesisNetworkBalancerState(
   private var _transidToInvokerMap: Map[TransactionId, InvokerInstanceId] = Map(),
   private var _pendingOutputTransfer: Map[TransactionId, (Number, InvokerInstanceId)] = Map(),
   // TODO: can add more metadata to transferlist if needed, potentially make the content of this List a case class on its own
-  private var _outputTransferHistoryPerComposition: Map[ActivationId, List[(Number, InvokerInstanceId, InvokerInstanceId)]] = Map(), 
+  private var _outputTransferHistoryPerComposition: Map[ActivationId, ListBuffer[(Number, InvokerInstanceId, InvokerInstanceId)]] = Map(), 
   private var _transidToCompositionIdentifier: Map[TransactionId, ActivationId] = Map(),
 
   private var _invokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
@@ -411,7 +426,7 @@ case class ThesisNetworkBalancerState(
   // transaction id shows the origin of the output transfer
   def pendingOutputTransfer: Map[TransactionId, (Number, InvokerInstanceId)] = _pendingOutputTransfer
   // size, origin, destination
-  def outputTransferHistory: Map[ActivationId, List[(Number, InvokerInstanceId, InvokerInstanceId)]] = _outputTransferHistoryPerComposition
+  def outputTransferHistory: Map[ActivationId, ListBuffer[(Number, InvokerInstanceId, InvokerInstanceId)]] = _outputTransferHistoryPerComposition
 
   def invokers: IndexedSeq[InvokerHealth] = _invokers
   def invokerSlots: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]] = _invokerSlots
@@ -435,11 +450,19 @@ case class ThesisNetworkBalancerState(
   def registerPendingOutputTransfer(transid: TransactionId, outputSize: Number, originInvoker: InvokerInstanceId) = {
     _pendingOutputTransfer =  _pendingOutputTransfer + (transid -> (outputSize, originInvoker))
   }
-  def resolveIncomingDataTransfer(parentTransid: TransactionId, destinationInvoker: InvokerInstanceId) = {
+  def resolveIncomingDataTransfer(parentTransid: TransactionId, destinationInvoker: InvokerInstanceId): Boolean = {
     _pendingOutputTransfer.get(parentTransid) match {
-      case Some ((transferSize, originInvoker)) => _outputTransferHistoryPerComposition = _outputTransferHistoryPerComposition + (_transidToCompositionIdentifier(parentTransid) -> List((transferSize, originInvoker, destinationInvoker)))
-      case None => {}
+      case Some ((transferSize, originInvoker)) => {
+        val compositionId = getCompositionIdentifier(parentTransid)
+        if (_outputTransferHistoryPerComposition.contains(compositionId)) {
+          _outputTransferHistoryPerComposition(compositionId) += ((transferSize, originInvoker, destinationInvoker))
+        } else {
+          _outputTransferHistoryPerComposition = _outputTransferHistoryPerComposition + (compositionId -> ListBuffer((transferSize, originInvoker, destinationInvoker)))
+        }
+      }
+      case None => {return false}
     }
+    true
   }
   def getCompositionIdentifier(transid: TransactionId): ActivationId = {
     _transidToCompositionIdentifier(transid)
@@ -453,7 +476,7 @@ case class ThesisNetworkBalancerState(
   def addChildToComposition(childTransid: TransactionId, parentTransid: TransactionId) = {
     _transidToCompositionIdentifier = _transidToCompositionIdentifier + (childTransid -> _transidToCompositionIdentifier(parentTransid))
   }
-  def finishComposition(rootCause: ActivationId): List[(Number, InvokerInstanceId, InvokerInstanceId)] =  {
+  def finishComposition(rootCause: ActivationId): ListBuffer[(Number, InvokerInstanceId, InvokerInstanceId)] =  {
     // TODO: clean up everything that has information about members of this composition!
     val transfers = _outputTransferHistoryPerComposition(rootCause)
     _outputTransferHistoryPerComposition = _outputTransferHistoryPerComposition - rootCause
