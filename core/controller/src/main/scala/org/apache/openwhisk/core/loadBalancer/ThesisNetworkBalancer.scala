@@ -175,6 +175,14 @@ class ThesisNetworkBalancer(
           this,
           s"[THESIS][PUBLISH] cause: ${msg.cause}"
         )
+      schedulingState.invokerSlots.map {
+        semaphore => {
+          logging.info(
+            this,
+            s"[THESIS][PUBLISH][INVOKERSTATE] invoker ${semaphore}: ${semaphore.availablePermits}"
+          )
+        }
+      }
       val invoker: Option[(InvokerInstanceId, Boolean)] = ThesisNetworkBalancer.schedule(
         msg,
         schedulingState,
@@ -271,6 +279,18 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
 
   def requiredProperties: Map[String, String] = kafkaHosts
 
+  def getHealthyInvokerWithMostMemoryAvailable(
+    invokerHealth: IndexedSeq[InvokerHealth],
+    invokerSemaphores: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]]
+  )(implicit logging: Logging, transId: TransactionId): InvokerInstanceId = {
+    val availableMemory = invokerSemaphores.map(x => x.availablePermits)
+    val memoryHealthZip = availableMemory zip invokerHealth
+    val indexedMemoryHealthZip = memoryHealthZip.sortWith(_._1 > _._1)
+    val healthy = indexedMemoryHealthZip.filter(_._2.status.isUsable)
+    logging.info(this, s"[THESIS][INVOKERQUERY] healthy invokers with sorted available memory: ${healthy}")
+    healthy(0)._2.id
+  }
+
   /**
    * Scans through all invokers and searches for an invoker tries to get a free slot on an invoker. If no slot can be
    * obtained, randomly picks a healthy invoker.
@@ -290,6 +310,9 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
     invokers: IndexedSeq[InvokerHealth],
     dispatched: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]],
     slots: Int)(implicit logging: Logging, transId: TransactionId): Option[(InvokerInstanceId, Boolean)] = {
+    
+    logging.info(this, s"[THESIS][SCHEDULER] maxConcurrent: ${maxConcurrent}")
+    logging.info(this, s"[THESIS][SCHEDULER] required memory (in MB): ${slots}")
 
     val healthyInvokers = invokers.filter(_.status.isUsable)
     if (!healthyInvokers.nonEmpty) {
@@ -299,6 +322,10 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
     var parentTransid = msg.ptransid
     val currentTransid = msg.transid
     val outputSize = 3.14  // TODO: from action annotations, derive a formula to combine input dimensions to calculate output dimensions
+
+    var wasForceAcquisition = true
+    var isComposition = true;
+    var isCompositionKickStart = false;
 
     // there should be a cause in the (recent) history of invocations
     msg.cause match {
@@ -311,12 +338,11 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
       }
       case None => {
         // TODO: this is probably true for non-composition functions
-        logging.warn(this, s"[THESIS][SCHEDULER] Is this a non-composition function?")
-        logging.warn(this, s"[THESIS][SCHEDULER] Cause field is empty, but it was not expected to be..")
+        logging.warn(this, s"[THESIS][SCHEDULER] This action is not part of a composition")
+        isComposition = false
       }
     }
 
-    var wasForceAcquisition = true
     val chosenInvokerId = if (parentTransid != TransactionId.unknown) {
       // there is a parent transaction id
       // options: - direct descendant of another action
@@ -333,22 +359,23 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
         } else {
           // Cannot schedule to parent invoker
           // GOAL: choose an empty invoker (as empty as possible) to house potential descendants as well
-          // TODO: how to know invoker load?
-          // for now: random healthy invoker
-          logging.info(this, s"[THESIS][SCHEDULER] 2nd force acquire..")
-          val randomInvokerId = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
-          dispatched(randomInvokerId.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
-          randomInvokerId
+          logging.info(this, s"[THESIS][SCHEDULER] parent invoker was not available, choosing invoker with most memory available")
+          val chosenInvokerId = getHealthyInvokerWithMostMemoryAvailable(invokers, dispatched)
+          if (!dispatched(chosenInvokerId.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots)) {
+            dispatched(chosenInvokerId.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)  // force acquire if necessary (should never be)
+          }
+          chosenInvokerId
         }
       } else {
         // first scheduled action of this composition (or not a composition at all.. [would this be flagged by an empty 'cause' field?])
         // GOAL: choose an empty invoker (as empty as possible) to house potential descendants as well
-        // TODO: how to know invoker load?
-        // for now: random healthy invoker
-          logging.info(this, s"[THESIS][SCHEDULER] 3rd force acquire..")
-        val randomInvokerId = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
-        dispatched(randomInvokerId.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
-        randomInvokerId
+        logging.info(this, s"[THESIS][SCHEDULER] first action or not composition, choosing invoker with most memory available")
+        if (isComposition) {isCompositionKickStart = true}
+        val chosenInvokerId = getHealthyInvokerWithMostMemoryAvailable(invokers, dispatched)
+        if (!dispatched(chosenInvokerId.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots)) {
+          dispatched(chosenInvokerId.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)  // force acquire if necessary (should never be)
+        }
+        chosenInvokerId
       }
     } else {
       logging.warn(this, s"[THESIS][SCHEDULER] Have to fall back due to lack of scheduling information: Scheduled randomly!")
@@ -360,6 +387,8 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
       this,
       s"[THESIS][SCHEDULER] Chosen invoker with ID ${chosenInvokerId.toInt} as target for execution"
     )
+
+    // TODO: remove try/catch block in future
     try{
       // Register transid with invoker choice
       schedulingState.registerInvokerAcquisition(currentTransid, chosenInvokerId)
@@ -375,15 +404,31 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
       msg.cause.foreach { c =>
         schedulingState.updateCauseHistory(c, currentTransid)
       }
-      if (fqnName.asString.contains("__") && fqnName.asString.split("__")(1) == "stop") {
-        // stop registering for this composition,
-        // log the internal bookkeeping structures
-        val transfers = schedulingState.finishComposition(schedulingState.getCompositionIdentifier(currentTransid))
-        logging.info(
-          this,
-          s"[THESIS][SCHEDULER] Transfers: ${transfers}"
-        )
-        // TODO: make sure any future action with the same root cause is handled properly
+
+      logging.info(this, s"[THESIS][SCHEDULER] checking the function name for custom naming scheme")
+      if (fqnName.asString.contains("__")) {
+        if (fqnName.asString.split("__")(1) == "stop") {
+          schedulingState.scheduleCompositionForfinish(currentTransid)
+        }
+      } else {
+        // either management function or not a composition (or not following the naming convention)
+        if (isComposition && !isCompositionKickStart) {
+          if (schedulingState.compositionScheduledForFinish(parentTransid)) {
+            // function was scheduled for termination, so terminate now:
+            // - stop registering for this composition,
+            // - log the internal bookkeeping structures
+            val transfers = schedulingState.finishComposition(currentTransid)
+            logging.info(
+              this,
+              s"[THESIS][SCHEDULER] Transfers [${transfers.length}]: ${transfers}"
+            )
+          }
+        } else {
+          logging.info(
+            this,
+            s"[THESIS][SCHEDULER] This action is not actually part of a bigger composition, but we schedule it anyways"
+          )
+        }
       }
     }
     catch {
@@ -409,6 +454,7 @@ case class ThesisNetworkBalancerState(
   // TODO: can add more metadata to transferlist if needed, potentially make the content of this List a case class on its own
   private var _outputTransferHistoryPerComposition: Map[ActivationId, ListBuffer[(Number, InvokerInstanceId, InvokerInstanceId)]] = Map(), 
   private var _transidToCompositionIdentifier: Map[TransactionId, ActivationId] = Map(),
+  private var _finishedCompositions: ListBuffer[ActivationId] = ListBuffer(),
 
   private var _invokers: IndexedSeq[InvokerHealth] = IndexedSeq.empty[InvokerHealth],
   protected[loadBalancer] var _invokerSlots: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]] =
@@ -427,6 +473,7 @@ case class ThesisNetworkBalancerState(
   def pendingOutputTransfer: Map[TransactionId, (Number, InvokerInstanceId)] = _pendingOutputTransfer
   // size, origin, destination
   def outputTransferHistory: Map[ActivationId, ListBuffer[(Number, InvokerInstanceId, InvokerInstanceId)]] = _outputTransferHistoryPerComposition
+  def finishedCompositions: ListBuffer[ActivationId] = _finishedCompositions
 
   def invokers: IndexedSeq[InvokerHealth] = _invokers
   def invokerSlots: IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]] = _invokerSlots
@@ -476,8 +523,25 @@ case class ThesisNetworkBalancerState(
   def addChildToComposition(childTransid: TransactionId, parentTransid: TransactionId) = {
     _transidToCompositionIdentifier = _transidToCompositionIdentifier + (childTransid -> _transidToCompositionIdentifier(parentTransid))
   }
-  def finishComposition(rootCause: ActivationId): ListBuffer[(Number, InvokerInstanceId, InvokerInstanceId)] =  {
+  def compositionScheduledForFinish(stopTransid: TransactionId): Boolean = {
+    val rootCause = getCompositionIdentifier(stopTransid)
+    compositionScheduledForFinish(rootCause)
+  }
+  def compositionScheduledForFinish(rootCause: ActivationId): Boolean = {
+    finishedCompositions.contains(rootCause)
+  }
+  def scheduleCompositionForfinish(stopTransid: TransactionId) {
+    val rootCause = getCompositionIdentifier(stopTransid)
+    finishedCompositions += rootCause
+  }
+  def finishComposition(stopTransid: TransactionId): ListBuffer[(Number, InvokerInstanceId, InvokerInstanceId)] =  {
     // TODO: clean up everything that has information about members of this composition!
+    val rootCause = getCompositionIdentifier(stopTransid)
+    if (!compositionScheduledForFinish(stopTransid)) {
+      logging.warn(this, s"[ERROR] this finish task was not scheduled yet!")
+      return ListBuffer()  // inappropiate call: termination was not due
+    }
+    finishedCompositions -= rootCause
     val transfers = _outputTransferHistoryPerComposition(rootCause)
     _outputTransferHistoryPerComposition = _outputTransferHistoryPerComposition - rootCause
 
