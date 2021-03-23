@@ -412,8 +412,9 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
         }
       } else {
         // either management function or not a composition (or not following the naming convention)
-        if (isComposition && !isCompositionKickStart) {
-          if (schedulingState.compositionScheduledForFinish(parentTransid)) {
+        // first function of a composition cannot be the end as well
+        if (isComposition){
+          if (!isCompositionKickStart && schedulingState.compositionScheduledForFinish(parentTransid)) {
             // function was scheduled for termination, so terminate now:
             // - stop registering for this composition,
             // - log the internal bookkeeping structures
@@ -423,11 +424,6 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
               s"[THESIS][SCHEDULER] Transfers [${transfers.length}]: ${transfers}"
             )
           }
-        } else {
-          logging.info(
-            this,
-            s"[THESIS][SCHEDULER] This action is not actually part of a bigger composition, but we schedule it anyways"
-          )
         }
       }
     }
