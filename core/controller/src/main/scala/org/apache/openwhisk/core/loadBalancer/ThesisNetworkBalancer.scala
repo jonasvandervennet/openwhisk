@@ -321,7 +321,6 @@ object ThesisNetworkBalancer extends LoadBalancerProvider {
 
     var parentTransid = msg.ptransid
     val currentTransid = msg.transid
-    val outputSize = 3.14  // TODO: from action annotations, derive a formula to combine input dimensions to calculate output dimensions
 
     var wasForceAcquisition = true
     var isComposition = true;
